@@ -12,17 +12,99 @@ Game.RANKS = {"A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"}
 
 function Game:new()
     local o = {
-        stock = {},           -- Draw pile
-        waste = {},           -- Drawn cards
-        foundations = {{}, {}, {}, {}},  -- 4 foundation piles
-        tableau = {{}, {}, {}, {}, {}, {}, {}},  -- 7 tableau columns
-        selected = nil,       -- Currently selected card(s)
+        stock = {},
+        waste = {},
+        foundations = {{}, {}, {}, {}},
+        tableau = {{}, {}, {}, {}, {}, {}, {}},
+        selected = nil,
         moves = 0,
         score = 0,
+        -- Undo history
+        history = {},
+        max_history = 100,
     }
     setmetatable(o, self)
     self.__index = self
     return o
+end
+
+-- Deep copy a card
+function Game:copyCard(card)
+    if not card then return nil end
+    return {
+        suit = card.suit,
+        rank = card.rank,
+        face_up = card.face_up,
+    }
+end
+
+-- Deep copy a pile of cards
+function Game:copyPile(pile)
+    local copy = {}
+    for i, card in ipairs(pile) do
+        copy[i] = self:copyCard(card)
+    end
+    return copy
+end
+
+-- Save current state to history (call before making a move)
+function Game:saveState()
+    local state = {
+        stock = self:copyPile(self.stock),
+        waste = self:copyPile(self.waste),
+        foundations = {
+            self:copyPile(self.foundations[1]),
+            self:copyPile(self.foundations[2]),
+            self:copyPile(self.foundations[3]),
+            self:copyPile(self.foundations[4]),
+        },
+        tableau = {
+            self:copyPile(self.tableau[1]),
+            self:copyPile(self.tableau[2]),
+            self:copyPile(self.tableau[3]),
+            self:copyPile(self.tableau[4]),
+            self:copyPile(self.tableau[5]),
+            self:copyPile(self.tableau[6]),
+            self:copyPile(self.tableau[7]),
+        },
+        moves = self.moves,
+        score = self.score,
+    }
+    
+    table.insert(self.history, state)
+    
+    -- Limit history size
+    if #self.history > self.max_history then
+        table.remove(self.history, 1)
+    end
+end
+
+-- Undo last move
+function Game:undo()
+    if #self.history == 0 then
+        return false
+    end
+    
+    local state = table.remove(self.history)
+    
+    self.stock = state.stock
+    self.waste = state.waste
+    self.foundations = state.foundations
+    self.tableau = state.tableau
+    self.moves = state.moves
+    self.score = state.score
+    
+    return true
+end
+
+-- Check if undo is available
+function Game:canUndo()
+    return #self.history > 0
+end
+
+-- Clear history (call when starting new game)
+function Game:clearHistory()
+    self.history = {}
 end
 
 function Game:createCard(suit_idx, rank_idx)
@@ -64,12 +146,15 @@ function Game:deal()
     self.moves = 0
     self.score = 0
     
+    -- Clear undo history for new game
+    self:clearHistory()
+    
     -- Deal to tableau
     local card_idx = 1
     for col = 1, 7 do
         for row = 1, col do
             local card = deck[card_idx]
-            card.face_up = (row == col)  -- Only top card face up
+            card.face_up = (row == col)
             table.insert(self.tableau[col], card)
             card_idx = card_idx + 1
         end
@@ -95,7 +180,6 @@ end
 
 function Game:canPlaceOnTableau(card, target_pile)
     if #target_pile == 0 then
-        -- Empty pile: only Kings allowed
         return card.rank == 13
     end
     
@@ -104,7 +188,6 @@ function Game:canPlaceOnTableau(card, target_pile)
         return false
     end
     
-    -- Must be opposite color and one rank lower
     local diff_color = self:getCardColor(card) ~= self:getCardColor(top_card)
     local one_lower = card.rank == top_card.rank - 1
     
@@ -115,13 +198,11 @@ function Game:canPlaceOnFoundation(card, foundation_idx)
     local foundation = self.foundations[foundation_idx]
     
     if #foundation == 0 then
-        -- Empty foundation: only Aces allowed
         return card.rank == 1
     end
     
     local top_card = foundation[#foundation]
     
-    -- Must be same suit and one rank higher
     local same_suit = card.suit == top_card.suit
     local one_higher = card.rank == top_card.rank + 1
     
@@ -129,9 +210,13 @@ function Game:canPlaceOnFoundation(card, foundation_idx)
 end
 
 function Game:drawFromStock()
+    -- Save state before move
+    self:saveState()
+    
     if #self.stock == 0 then
-        -- Recycle waste back to stock
         if #self.waste == 0 then
+            -- Remove saved state since no move was made
+            table.remove(self.history)
             return false
         end
         while #self.waste > 0 do
@@ -139,11 +224,10 @@ function Game:drawFromStock()
             card.face_up = false
             table.insert(self.stock, card)
         end
-        self.score = math.max(0, self.score - 20)  -- Penalty for recycling
+        self.score = math.max(0, self.score - 20)
         return true
     end
     
-    -- Draw one card (or three for draw-3 variant)
     local card = table.remove(self.stock)
     card.face_up = true
     table.insert(self.waste, card)
@@ -170,6 +254,9 @@ function Game:moveToFoundation(source_type, source_idx, foundation_idx)
     if not self:canPlaceOnFoundation(card, foundation_idx) then
         return false
     end
+    
+    -- Save state before move
+    self:saveState()
     
     -- Move the card
     table.remove(source_pile)
@@ -201,10 +288,8 @@ function Game:moveToTableau(source_type, source_idx, card_pos, target_col)
         source_pile = self.tableau[source_idx]
         if card_pos > #source_pile then return false end
         
-        -- Check if the card at position is face up
         if not source_pile[card_pos].face_up then return false end
         
-        -- Get all cards from position to end
         for i = card_pos, #source_pile do
             table.insert(cards_to_move, source_pile[i])
         end
@@ -219,10 +304,12 @@ function Game:moveToTableau(source_type, source_idx, card_pos, target_col)
     
     if #cards_to_move == 0 then return false end
     
-    -- Check if move is valid
     if not self:canPlaceOnTableau(cards_to_move[1], self.tableau[target_col]) then
         return false
     end
+    
+    -- Save state before move
+    self:saveState()
     
     -- Remove cards from source
     if source_type == "tableau" then
@@ -249,7 +336,7 @@ function Game:moveToTableau(source_type, source_idx, card_pos, target_col)
     
     self.moves = self.moves + 1
     if source_type == "foundation" then
-        self.score = math.max(0, self.score - 15)  -- Penalty
+        self.score = math.max(0, self.score - 15)
     else
         self.score = self.score + 5
     end
@@ -258,7 +345,6 @@ function Game:moveToTableau(source_type, source_idx, card_pos, target_col)
 end
 
 function Game:autoMoveToFoundation()
-    -- Try to automatically move cards to foundation
     local moved = false
     
     -- Check waste
@@ -307,8 +393,6 @@ function Game:checkWin()
 end
 
 function Game:getHint()
-    -- Find a valid move to suggest
-    
     -- Check waste to foundation
     if #self.waste > 0 then
         local card = self.waste[#self.waste]
@@ -350,7 +434,6 @@ function Game:getHint()
             if card.face_up then
                 for to = 1, 7 do
                     if from ~= to and self:canPlaceOnTableau(card, self.tableau[to]) then
-                        -- Avoid pointless moves (King to empty)
                         if card.rank ~= 13 or #self.tableau[to] > 0 or card_idx > 1 then
                             return {type = "tableau_to_tableau", from = from, to = to, card_idx = card_idx}
                         end
@@ -366,6 +449,47 @@ function Game:getHint()
     end
     
     return nil
+end
+
+-- Convert game state to saveable data
+function Game:toSaveData()
+    return {
+        stock = self:copyPile(self.stock),
+        waste = self:copyPile(self.waste),
+        foundations = {
+            self:copyPile(self.foundations[1]),
+            self:copyPile(self.foundations[2]),
+            self:copyPile(self.foundations[3]),
+            self:copyPile(self.foundations[4]),
+        },
+        tableau = {
+            self:copyPile(self.tableau[1]),
+            self:copyPile(self.tableau[2]),
+            self:copyPile(self.tableau[3]),
+            self:copyPile(self.tableau[4]),
+            self:copyPile(self.tableau[5]),
+            self:copyPile(self.tableau[6]),
+            self:copyPile(self.tableau[7]),
+        },
+        moves = self.moves,
+        score = self.score,
+        -- Don't save history to keep file small
+    }
+end
+
+-- Load game state from saved data
+function Game:fromSaveData(data)
+    if not data then return false end
+    
+    self.stock = data.stock or {}
+    self.waste = data.waste or {}
+    self.foundations = data.foundations or {{}, {}, {}, {}}
+    self.tableau = data.tableau or {{}, {}, {}, {}, {}, {}, {}}
+    self.moves = data.moves or 0
+    self.score = data.score or 0
+    self:clearHistory()
+    
+    return true
 end
 
 return Game
