@@ -234,8 +234,8 @@ To add undo functionality, you would:
 
 ### Planned Features
 
-- [ ] Undo/redo functionality
-- [ ] Save and resume game
+- [X] Undo/redo functionality
+- [X] Save and resume game
 - [ ] Draw-3 variant option
 - [ ] Game statistics tracking
 - [ ] Best scores leaderboard
