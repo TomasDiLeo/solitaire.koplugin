@@ -303,16 +303,6 @@ function SolitaireUI:drawStock(bb, x, y)
     if #self.game.stock > 0 then
         local card = {face_up = false}
         self:drawCard(bb, x, y, card, false, true)
-        
-        local count_text = tostring(#self.game.stock)
-        local text_widget = TextWidget:new{
-            text = count_text,
-            face = self.small_font,
-            fgcolor = Blitbuffer.COLOR_BLACK,
-        }
-        local tw = text_widget:getSize().w
-        text_widget:paintTo(bb, x + (self.card_width - tw) / 2, y + self.card_height + 2)
-        text_widget:free()
     else
         self:drawEmptySlot(bb, x, y, "↺")
     end
