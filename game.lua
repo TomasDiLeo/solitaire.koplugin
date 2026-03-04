@@ -19,6 +19,14 @@ function Game:new()
         selected = nil,
         moves = 0,
         score = 0,
+        -- Draw mode: 1 = draw one, 3 = draw three
+        draw_mode = 1,
+        -- How many cards were drawn in the last draw (for display purposes)
+        last_draw_count = 0,
+        -- Timer
+        start_time = nil,
+        elapsed_time = 0,
+        timer_running = false,
         -- Undo history
         history = {},
         max_history = 100,
@@ -145,6 +153,12 @@ function Game:deal()
     self.selected = nil
     self.moves = 0
     self.score = 0
+    self.last_draw_count = 0
+    
+    -- Reset and start timer
+    self.elapsed_time = 0
+    self.start_time = os.time()
+    self.timer_running = true
     
     -- Clear undo history for new game
     self:clearHistory()
@@ -224,14 +238,56 @@ function Game:drawFromStock()
             card.face_up = false
             table.insert(self.stock, card)
         end
+        self.last_draw_count = 0
         self.score = math.max(0, self.score - 20)
         return true
     end
     
-    local card = table.remove(self.stock)
-    card.face_up = true
-    table.insert(self.waste, card)
+    -- Draw 1 or 3 cards depending on draw_mode
+    local cards_to_draw = math.min(self.draw_mode, #self.stock)
+    self.last_draw_count = cards_to_draw
+    for i = 1, cards_to_draw do
+        local card = table.remove(self.stock)
+        card.face_up = true
+        table.insert(self.waste, card)
+    end
     return true
+end
+
+-- Set draw mode (1 or 3)
+function Game:setDrawMode(mode)
+    if mode == 1 or mode == 3 then
+        self.draw_mode = mode
+    end
+end
+
+-- Timer functions
+function Game:startTimer()
+    self.start_time = os.time()
+    self.timer_running = true
+end
+
+function Game:stopTimer()
+    if self.timer_running and self.start_time then
+        self.elapsed_time = self.elapsed_time + (os.time() - self.start_time)
+        self.start_time = nil
+        self.timer_running = false
+    end
+end
+
+function Game:getElapsedTime()
+    local total = self.elapsed_time
+    if self.timer_running and self.start_time then
+        total = total + (os.time() - self.start_time)
+    end
+    return total
+end
+
+function Game:formatTime(seconds)
+    if not seconds then seconds = self:getElapsedTime() end
+    local mins = math.floor(seconds / 60)
+    local secs = seconds % 60
+    return string.format("%d:%02d", mins, secs)
 end
 
 function Game:moveToFoundation(source_type, source_idx, foundation_idx)
@@ -453,6 +509,8 @@ end
 
 -- Convert game state to saveable data
 function Game:toSaveData()
+    -- Freeze timer before saving
+    local elapsed = self:getElapsedTime()
     return {
         stock = self:copyPile(self.stock),
         waste = self:copyPile(self.waste),
@@ -473,6 +531,9 @@ function Game:toSaveData()
         },
         moves = self.moves,
         score = self.score,
+        draw_mode = self.draw_mode,
+        last_draw_count = self.last_draw_count,
+        elapsed_time = elapsed,
         -- Don't save history to keep file small
     }
 end
@@ -487,6 +548,11 @@ function Game:fromSaveData(data)
     self.tableau = data.tableau or {{}, {}, {}, {}, {}, {}, {}}
     self.moves = data.moves or 0
     self.score = data.score or 0
+    self.draw_mode = data.draw_mode or 1
+    self.last_draw_count = data.last_draw_count or 0
+    self.elapsed_time = data.elapsed_time or 0
+    self.start_time = os.time()
+    self.timer_running = true
     self:clearHistory()
     
     return true

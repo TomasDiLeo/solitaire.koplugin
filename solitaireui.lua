@@ -19,6 +19,7 @@ local Screen = Device.screen
 local _ = require("gettext")
 
 local Game = require("game")
+local Stats = require("stats")
 
 local SolitaireUI = InputContainer:extend{
     name = "solitaire_ui",
@@ -30,20 +31,23 @@ function SolitaireUI:init()
     self.dimen = Screen:getSize()
     self.screen_width = self.dimen.w
     self.screen_height = self.dimen.h
-    
+
     -- UI element heights
     self.status_bar_height = 35
     self.button_bar_height = 50
-    
+
     -- Card dimensions
     self.card_width = math.floor(self.screen_width / 9)
     self.card_height = math.floor(self.card_width * 1.4)
     self.card_spacing = math.floor(self.card_width * 0.15)
     self.stack_offset = math.floor(self.card_height * 0.35)
-    
+
+    -- Draw-3 fan offset for waste pile
+    self.waste_fan_offset = math.floor(self.card_width * 0.3)
+
     -- Layout positions
     self.margin = math.floor(self.screen_width * 0.02)
-    
+
     -- Fonts
     self.rank_font = Font:getFace("cfont", math.floor(self.card_width * 0.22))
     self.suit_center_font = Font:getFace("cfont", math.floor(self.card_width * 0.30))
@@ -52,22 +56,37 @@ function SolitaireUI:init()
 
     -- Save file path
     self.save_path = DataStorage:getSettingsDir() .. "/solitaire_save.lua"
-    
+
+    -- Settings path (for draw mode preference)
+    self.settings_path = DataStorage:getSettingsDir() .. "/solitaire_settings.lua"
+
+    -- Load settings
+    self:loadSettings()
+
     -- Game state
     self.game = Game:new()
-    
+    self.game:setDrawMode(self.draw_mode_pref)
+
+    -- Stats
+    self.stats = Stats:new()
+
+    -- Track if current game has had moves (to know if it's an "active" game)
+    self.game_started = false
+
     -- Try to load saved game
     if not self:loadGame() then
         self.game:deal()
+    else
+        self.game_started = true
     end
-    
+
     -- Selection state
     self.selected_source = nil
     self.hint_highlight = nil
-    
+
     -- Touch zones
     self.touch_zones = {}
-    
+
     -- Input handling
     if Device:isTouchDevice() then
         self.ges_events = {
@@ -85,12 +104,27 @@ function SolitaireUI:init()
             },
         }
     end
-    
+
     if Device:hasKeys() then
         self.key_events.Close = { { "Back" }, doc = "close game" }
     end
-    
+
     self:buildUI()
+end
+
+function SolitaireUI:loadSettings()
+    local ok, settings = pcall(LuaSettings.open, LuaSettings, self.settings_path)
+    if ok and settings then
+        self.draw_mode_pref = settings:readSetting("draw_mode") or 1
+    else
+        self.draw_mode_pref = 1
+    end
+end
+
+function SolitaireUI:saveSettings()
+    local settings = LuaSettings:open(self.settings_path)
+    settings:saveSetting("draw_mode", self.draw_mode_pref)
+    settings:flush()
 end
 
 function SolitaireUI:saveGame()
@@ -105,12 +139,12 @@ function SolitaireUI:loadGame()
     if not ok or not settings then
         return false
     end
-    
+
     local save_data = settings:readSetting("game")
     if not save_data then
         return false
     end
-    
+
     return self.game:fromSaveData(save_data)
 end
 
@@ -120,9 +154,12 @@ end
 
 function SolitaireUI:buildUI()
     self.touch_zones = {}
-    
+
     local game_area_height = self.screen_height - self.status_bar_height - self.button_bar_height
-    
+
+    -- Draw mode label
+    local draw_mode_label = self.game.draw_mode == 3 and "D3" or "D1"
+
     local button_bar = ButtonTable:new{
         width = self.screen_width,
         buttons = {
@@ -145,6 +182,18 @@ function SolitaireUI:buildUI()
                     callback = function() self:autoMove() end,
                 },
                 {
+                    text = _(draw_mode_label),
+                    callback = function() self:toggleDrawMode() end,
+                },
+                {
+                    text = _("Stats"),
+                    callback = function() self:showStats() end,
+                },
+                {
+                    text = _("Top"),
+                    callback = function() self:showLeaderboard() end,
+                },
+                {
                     text = _("Close"),
                     callback = function() self:onClose() end,
                 },
@@ -152,14 +201,14 @@ function SolitaireUI:buildUI()
         },
         show_parent = self,
     }
-    
+
     self.button_bar_height = button_bar:getSize().h
     game_area_height = self.screen_height - self.status_bar_height - self.button_bar_height
-    
-    local undo_count = #self.game.history
-    local status_text = string.format("Moves: %d  |  Score: %d  |  Undo: %d", 
-        self.game.moves, self.game.score, undo_count)
-    
+
+    local time_str = self.game:formatTime()
+    local status_text = string.format("Moves: %d  |  Score: %d  |  Time: %s",
+        self.game.moves, self.game.score, time_str)
+
     local status_bar = FrameContainer:new{
         width = self.screen_width,
         height = self.status_bar_height,
@@ -174,7 +223,7 @@ function SolitaireUI:buildUI()
             }
         }
     }
-    
+
     local game_area = WidgetContainer:new{
         dimen = Geom:new{
             w = self.screen_width,
@@ -185,7 +234,7 @@ function SolitaireUI:buildUI()
     game_area.paintTo = function(widget, bb, x, y)
         widget._parent:drawGame(bb, x, y)
     end
-    
+
     self[1] = FrameContainer:new{
         width = self.screen_width,
         height = self.screen_height,
@@ -203,20 +252,20 @@ end
 
 function SolitaireUI:drawGame(bb, offset_x, offset_y)
     local y_offset = offset_y + 10
-    
+
     self:drawStock(bb, self.margin, y_offset)
     self:drawWaste(bb, self.margin + self.card_width + self.card_spacing, y_offset)
-    
+
     local foundation_start_x = self.screen_width - (4 * self.card_width) - (3 * self.card_spacing) - self.margin
     for f = 1, 4 do
         local x = foundation_start_x + (f - 1) * (self.card_width + self.card_spacing)
         self:drawFoundation(bb, x, y_offset, f)
     end
-    
+
     local tableau_y = y_offset + self.card_height + self.margin
     local total_tableau_width = 7 * self.card_width + 6 * self.card_spacing
     local tableau_start_x = (self.screen_width - total_tableau_width) / 2
-    
+
     for col = 1, 7 do
         local x = tableau_start_x + (col - 1) * (self.card_width + self.card_spacing)
         self:drawTableauColumn(bb, x, tableau_y, col)
@@ -225,22 +274,22 @@ end
 
 function SolitaireUI:drawCard(bb, x, y, card, highlighted, is_top_card)
     local border_width = highlighted and 3 or 1
-    
+
     bb:paintRect(x, y, self.card_width, self.card_height, Blitbuffer.COLOR_WHITE)
     bb:paintBorder(x, y, self.card_width, self.card_height, border_width, Blitbuffer.COLOR_BLACK)
-    
+
     if card and card.face_up then
         local rank = self.game.RANKS[card.rank]
         local suit = self.game.SUITS[card.suit].symbol
         local color = self.game:getCardColor(card)
-        
+
         local text_color = Blitbuffer.COLOR_BLACK
         if color == "red" then
             text_color = Blitbuffer.COLOR_DARK_GRAY
         end
-        
+
         local padding = 3
-        
+
         local rank_widget = TextWidget:new{
             text = rank,
             face = self.rank_font,
@@ -248,7 +297,7 @@ function SolitaireUI:drawCard(bb, x, y, card, highlighted, is_top_card)
         }
         rank_widget:paintTo(bb, x + padding, y + padding)
         rank_widget:free()
-        
+
         if is_top_card then
             local suit_center_widget = TextWidget:new{
                 text = suit,
@@ -257,14 +306,14 @@ function SolitaireUI:drawCard(bb, x, y, card, highlighted, is_top_card)
             }
             local sw = suit_center_widget:getSize().w
             local sh = suit_center_widget:getSize().h
-            
+
             local center_x = x + (self.card_width - sw) / 2
             local center_y = y + self.card_height - sh - (self.card_height * 0.25)
-            
+
             suit_center_widget:paintTo(bb, center_x, center_y)
             suit_center_widget:free()
         end
-        
+
     elseif card then
         local pattern_margin = 4
         for py = y + pattern_margin, y + self.card_height - pattern_margin - 2, 4 do
@@ -278,7 +327,7 @@ end
 function SolitaireUI:drawEmptySlot(bb, x, y, label)
     bb:paintRect(x, y, self.card_width, self.card_height, Blitbuffer.COLOR_LIGHT_GRAY)
     bb:paintBorder(x, y, self.card_width, self.card_height, 1, Blitbuffer.COLOR_GRAY)
-    
+
     if label then
         local text_widget = TextWidget:new{
             text = label,
@@ -287,8 +336,8 @@ function SolitaireUI:drawEmptySlot(bb, x, y, label)
         }
         local tw = text_widget:getSize().w
         local th = text_widget:getSize().h
-        text_widget:paintTo(bb, 
-            x + (self.card_width - tw) / 2, 
+        text_widget:paintTo(bb,
+            x + (self.card_width - tw) / 2,
             y + (self.card_height - th) / 2)
         text_widget:free()
     end
@@ -299,7 +348,7 @@ function SolitaireUI:drawStock(bb, x, y)
         x = x, y = y, w = self.card_width, h = self.card_height,
         type = "stock"
     })
-    
+
     if #self.game.stock > 0 then
         local card = {face_up = false}
         self:drawCard(bb, x, y, card, false, true)
@@ -309,22 +358,56 @@ function SolitaireUI:drawStock(bb, x, y)
 end
 
 function SolitaireUI:drawWaste(bb, x, y)
-    table.insert(self.touch_zones, {
-        x = x, y = y, w = self.card_width, h = self.card_height,
-        type = "waste"
-    })
-    
-    local is_selected = self.selected_source and 
+    local is_selected = self.selected_source and
         self.selected_source.type == "waste"
-    local is_hint = self.hint_highlight and 
-        (self.hint_highlight.type == "waste_to_foundation" or 
+    local is_hint = self.hint_highlight and
+        (self.hint_highlight.type == "waste_to_foundation" or
          self.hint_highlight.type == "waste_to_tableau")
-    
-    if #self.game.waste > 0 then
-        local card = self.game.waste[#self.game.waste]
-        self:drawCard(bb, x, y, card, is_selected or is_hint, true)
-    else
+
+    local waste = self.game.waste
+    local waste_count = #waste
+
+    if waste_count == 0 then
+        -- Register touch zone for empty waste
+        table.insert(self.touch_zones, {
+            x = x, y = y, w = self.card_width, h = self.card_height,
+            type = "waste"
+        })
         self:drawEmptySlot(bb, x, y, nil)
+        return
+    end
+
+    -- In Draw-3 mode, show up to 3 fanned cards from the waste
+    if self.game.draw_mode == 3 and waste_count > 1 then
+        -- Show up to 3 cards fanned out
+        local show_count = math.min(3, waste_count)
+        local start_idx = waste_count - show_count + 1
+
+        for i = 0, show_count - 1 do
+            local card_idx = start_idx + i
+            local card = waste[card_idx]
+            local card_x = x + i * self.waste_fan_offset
+            local is_top = (i == show_count - 1)
+            local highlight = is_top and (is_selected or is_hint)
+
+            -- Only the top card gets a touch zone for playing
+            if is_top then
+                table.insert(self.touch_zones, {
+                    x = card_x, y = y, w = self.card_width, h = self.card_height,
+                    type = "waste"
+                })
+            end
+
+            self:drawCard(bb, card_x, y, card, highlight, is_top)
+        end
+    else
+        -- Draw-1 mode: show single card
+        table.insert(self.touch_zones, {
+            x = x, y = y, w = self.card_width, h = self.card_height,
+            type = "waste"
+        })
+        local card = waste[waste_count]
+        self:drawCard(bb, x, y, card, is_selected or is_hint, true)
     end
 end
 
@@ -333,11 +416,11 @@ function SolitaireUI:drawFoundation(bb, x, y, foundation_idx)
         x = x, y = y, w = self.card_width, h = self.card_height,
         type = "foundation", index = foundation_idx
     })
-    
+
     local foundation = self.game.foundations[foundation_idx]
-    local is_hint = self.hint_highlight and 
+    local is_hint = self.hint_highlight and
         self.hint_highlight.foundation == foundation_idx
-    
+
     if #foundation > 0 then
         local card = foundation[#foundation]
         self:drawCard(bb, x, y, card, is_hint, true)
@@ -349,16 +432,16 @@ end
 
 function SolitaireUI:drawTableauColumn(bb, x, y, col_idx)
     local column = self.game.tableau[col_idx]
-    
-    local is_selected_col = self.selected_source and 
-        self.selected_source.type == "tableau" and 
+
+    local is_selected_col = self.selected_source and
+        self.selected_source.type == "tableau" and
         self.selected_source.index == col_idx
-    
-    local is_hint_from = self.hint_highlight and 
+
+    local is_hint_from = self.hint_highlight and
         self.hint_highlight.from == col_idx
-    local is_hint_to = self.hint_highlight and 
+    local is_hint_to = self.hint_highlight and
         (self.hint_highlight.to == col_idx or self.hint_highlight.tableau == col_idx)
-    
+
     if #column == 0 then
         table.insert(self.touch_zones, {
             x = x, y = y, w = self.card_width, h = self.card_height,
@@ -373,17 +456,17 @@ function SolitaireUI:drawTableauColumn(bb, x, y, col_idx)
         for i, card in ipairs(column) do
             local card_y = y + (i - 1) * self.stack_offset
             local card_height = (i == #column) and self.card_height or self.stack_offset
-            
-            local is_card_selected = is_selected_col and 
+
+            local is_card_selected = is_selected_col and
                 i >= self.selected_source.card_pos
-            local is_card_hint = (is_hint_from and self.hint_highlight.card_idx and 
+            local is_card_hint = (is_hint_from and self.hint_highlight.card_idx and
                 i >= self.hint_highlight.card_idx) or (is_hint_to and i == #column)
-            
+
             table.insert(self.touch_zones, {
                 x = x, y = card_y, w = self.card_width, h = card_height,
                 type = "tableau", index = col_idx, card_pos = i
             })
-            
+
             local is_top = (i == #column)
             self:drawCard(bb, x, card_y, card, is_card_selected or is_card_hint, is_top)
         end
@@ -404,15 +487,20 @@ end
 function SolitaireUI:onTap(arg, ges)
     local pos = ges.pos
     local zone = self:findTouchZone(pos.x, pos.y)
-    
+
     if not zone then
         self.selected_source = nil
         self:refreshUI()
         return true
     end
-    
+
     self.hint_highlight = nil
-    
+
+    -- Mark game as started on first interaction
+    if not self.game_started then
+        self.game_started = true
+    end
+
     if zone.type == "stock" then
         self.selected_source = nil
         self.game:drawFromStock()
@@ -420,7 +508,7 @@ function SolitaireUI:onTap(arg, ges)
         self:refreshUI()
         return true
     end
-    
+
     if zone.type == "waste" then
         if self.selected_source then
             self.selected_source = nil
@@ -432,7 +520,7 @@ function SolitaireUI:onTap(arg, ges)
         self:refreshUI()
         return true
     end
-    
+
     if zone.type == "foundation" then
         if self.selected_source then
             local success = false
@@ -441,7 +529,7 @@ function SolitaireUI:onTap(arg, ges)
             elseif self.selected_source.type == "tableau" then
                 local col = self.game.tableau[self.selected_source.index]
                 if self.selected_source.card_pos == #col then
-                    success = self.game:moveToFoundation("tableau", 
+                    success = self.game:moveToFoundation("tableau",
                         self.selected_source.index, zone.index)
                 end
             end
@@ -456,7 +544,7 @@ function SolitaireUI:onTap(arg, ges)
         self:refreshUI()
         return true
     end
-    
+
     if zone.type == "tableau" then
         if self.selected_source then
             local success = false
@@ -464,9 +552,9 @@ function SolitaireUI:onTap(arg, ges)
                 success = self.game:moveToTableau("waste", nil, nil, zone.index)
             elseif self.selected_source.type == "tableau" then
                 if self.selected_source.index ~= zone.index then
-                    success = self.game:moveToTableau("tableau", 
-                        self.selected_source.index, 
-                        self.selected_source.card_pos, 
+                    success = self.game:moveToTableau("tableau",
+                        self.selected_source.index,
+                        self.selected_source.card_pos,
                         zone.index)
                 end
             elseif self.selected_source.type == "foundation" then
@@ -496,14 +584,14 @@ function SolitaireUI:onTap(arg, ges)
         self:refreshUI()
         return true
     end
-    
+
     return true
 end
 
 function SolitaireUI:onHold(arg, ges)
     local pos = ges.pos
     local zone = self:findTouchZone(pos.x, pos.y)
-    
+
     if zone then
         if zone.type == "waste" and #self.game.waste > 0 then
             local card = self.game.waste[#self.game.waste]
@@ -536,7 +624,7 @@ function SolitaireUI:onHold(arg, ges)
             end
         end
     end
-    
+
     self.selected_source = nil
     self:refreshUI()
     return true
@@ -549,9 +637,16 @@ function SolitaireUI:refreshUI()
 end
 
 function SolitaireUI:newGame()
+    -- Record loss for the current game if it was started and not won
+    if self.game_started and not self.game:checkWin() and self.game.moves > 0 then
+        self.stats:recordLoss(self.game.draw_mode)
+    end
+
     self.game:deal()
+    self.game:setDrawMode(self.draw_mode_pref)
     self.selected_source = nil
     self.hint_highlight = nil
+    self.game_started = false
     self:deleteSave()
     self:refreshUI()
 end
@@ -575,7 +670,7 @@ function SolitaireUI:showHint()
     if hint then
         self.hint_highlight = hint
         self:refreshUI()
-        
+
         UIManager:scheduleIn(2, function()
             self.hint_highlight = nil
             if self[1] then
@@ -593,20 +688,20 @@ end
 function SolitaireUI:autoMove()
     local moved = true
     local total_moves = 0
-    
+
     while moved and total_moves < 52 do
         moved = self.game:autoMoveToFoundation()
         if moved then
             total_moves = total_moves + 1
         end
     end
-    
+
     if total_moves > 0 then
         self:saveGame()
     end
-    
+
     self:refreshUI()
-    
+
     if self.game:checkWin() then
         self:showWinMessage()
     elseif total_moves == 0 then
@@ -617,18 +712,162 @@ function SolitaireUI:autoMove()
     end
 end
 
+function SolitaireUI:toggleDrawMode()
+    if self.game.draw_mode == 1 then
+        self.draw_mode_pref = 3
+    else
+        self.draw_mode_pref = 1
+    end
+    self.game:setDrawMode(self.draw_mode_pref)
+    self:saveSettings()
+    self:saveGame()
+
+    local mode_name = self.draw_mode_pref == 3 and "Draw 3" or "Draw 1"
+    UIManager:show(InfoMessage:new{
+        text = string.format(_("Switched to %s mode"), mode_name),
+        timeout = 1,
+    })
+
+    self:refreshUI()
+end
+
+function SolitaireUI:showMoreMenu()
+    -- Show a simple menu with Stats, Leaderboard, Reset Stats
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local dialog
+    dialog = ButtonDialog:new{
+        title = _("Solitaire"),
+        buttons = {
+            {
+                {
+                    text = _("Statistics"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        self:showStats()
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("Leaderboard"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        self:showLeaderboard()
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("Reset Statistics"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        self:confirmResetStats()
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("Cancel"),
+                    callback = function()
+                        UIManager:close(dialog)
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+end
+
+function SolitaireUI:showStats()
+    local text = self.stats:getStatsText()
+    UIManager:show(InfoMessage:new{
+        text = text,
+        width = math.floor(self.screen_width * 0.8),
+    })
+end
+
+function SolitaireUI:showLeaderboard()
+    local text = self.stats:getLeaderboardText()
+    UIManager:show(InfoMessage:new{
+        text = text,
+        width = math.floor(self.screen_width * 0.8),
+    })
+end
+
+function SolitaireUI:confirmResetStats()
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local dialog
+    dialog = ButtonDialog:new{
+        title = _("Reset Statistics"),
+        text = _("Are you sure you want to reset all statistics and leaderboard data? This cannot be undone."),
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    callback = function()
+                        UIManager:close(dialog)
+                    end,
+                },
+                {
+                    text = _("Reset"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        self.stats:reset()
+                        UIManager:show(InfoMessage:new{
+                            text = _("Statistics have been reset."),
+                            timeout = 2,
+                        })
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+end
+
 function SolitaireUI:showWinMessage()
+    local elapsed = self.game:getElapsedTime()
+    local time_str = self.game:formatTime(elapsed)
+
+    -- Stop timer
+    self.game:stopTimer()
+
+    -- Record win in stats
+    self.stats:recordWin(
+        self.game.score,
+        self.game.moves,
+        elapsed,
+        self.game.draw_mode
+    )
+
+    -- Check if this is a new best
+    local extra = ""
+    if self.game.score >= self.stats.best_score then
+        extra = "\n🏆 New Best Score!"
+    end
+    if self.stats.best_time == elapsed then
+        extra = extra .. "\n⚡ New Best Time!"
+    end
+    if self.stats.fewest_moves == self.game.moves then
+        extra = extra .. "\n🎯 New Fewest Moves!"
+    end
+
     self:deleteSave()
+    self.game_started = false
+
     UIManager:show(InfoMessage:new{
         text = string.format(
-            _("Congratulations! You won!\n\nMoves: %d\nScore: %d"),
-            self.game.moves, self.game.score
+            _("Congratulations! You won!\n\nMoves: %d\nScore: %d\nTime: %s\nMode: Draw-%d%s\n\nWin Streak: %d"),
+            self.game.moves, self.game.score, time_str,
+            self.game.draw_mode, extra, self.stats.current_win_streak
         ),
     })
 end
 
 function SolitaireUI:onClose()
     self:saveGame()
+    -- Stop the timer refresh
+    self.game:stopTimer()
     UIManager:close(self)
     return true
 end
